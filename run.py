@@ -19,6 +19,10 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--headless",   action="store_true")
 parser.add_argument("--no-vision",  action="store_true")
 parser.add_argument("--episodes",   type=int, default=1)
+parser.add_argument("--command",    type=str, default=None,
+                    help='Natural language pick instruction, e.g. "pick the blue pillar first"')
+parser.add_argument("--api-key",    type=str, default=None,
+                    help="Anthropic API key (overrides ANTHROPIC_API_KEY env var)")
 args, _ = parser.parse_known_args()
 
 from isaacsim import SimulationApp
@@ -38,7 +42,8 @@ from isaacsim.robot.manipulators.grippers import ParallelGripper
 from isaacsim.storage.native import get_assets_root_path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vision import VisionDetector
+from vision    import VisionDetector
+from language  import parse_command
 
 
 # =============================================================================
@@ -289,11 +294,31 @@ def main():
         label=OBJ_DEFS[0][1],
     )
 
+    # ---- Language command ---------------------------------------------------
+    if args.command:
+        instruction = args.command
+    else:
+        print("\nObjects available:")
+        print("  0 — red square cube     (4×4×4 cm)")
+        print("  1 — blue tall pillar    (3×3×7 cm)")
+        print("  2 — green flat tile     (5×5×3.5 cm)")
+        print("  3 — yellow medium block (4×4×5.5 cm)")
+        instruction = input("\nInstruction (Enter to pick all in default order): ").strip()
+
+    if instruction:
+        print(f"\n[LANG] Parsing: \"{instruction}\"")
+        pick_order = parse_command(instruction, api_key=args.api_key)
+    else:
+        pick_order = [0, 1, 2, 3]
+
+    print(f"[LANG] Pick order: {pick_order}  "
+          f"({', '.join(OBJ_DEFS[i][0] for i in pick_order)})")
+
     all_results = []
 
     for ep in range(args.episodes):
         print(f"\n{'='*60}")
-        print(f"Episode {ep+1}/{args.episodes}  —  4 objects, Bin A → Bin B")
+        print(f"Episode {ep+1}/{args.episodes}  —  {len(pick_order)} objects, Bin A → Bin B")
         print(f"{'='*60}")
 
         world, franka, objs = build_scene(assets_root)
@@ -307,7 +332,9 @@ def main():
 
         ep_ok = []
 
-        for i, (obj, (name, label, size, _)) in enumerate(zip(objs, OBJ_DEFS)):
+        for i in pick_order:
+            obj                   = objs[i]
+            name, label, size, _  = OBJ_DEFS[i]
             grasp_z  = TABLE_H + size[2] / 2
             pick_xy  = BIN_A_CTR + GRID_OFFSETS[i]
             place_xy = BIN_B_CTR + GRID_OFFSETS[i]
@@ -369,8 +396,8 @@ def main():
     for ep, res in enumerate(all_results):
         n = sum(res)
         print(f"Episode {ep+1}: {n}/{len(res)} objects transferred")
-        for i, ok in enumerate(res):
-            print(f"  {OBJ_DEFS[i][0]:6s} ({np.round(OBJ_DEFS[i][2]*100,0)} cm): "
+        for idx, (obj_i, ok) in enumerate(zip(pick_order, res)):
+            print(f"  {OBJ_DEFS[obj_i][0]:6s} ({np.round(OBJ_DEFS[obj_i][2]*100,0)} cm): "
                   f"{'OK' if ok else 'FAIL'}")
     print(f"{'='*60}")
 
