@@ -103,74 +103,7 @@ Stable stack order (widest base first): **2 → 3 → 0 → 1**
 
 ## Setup
 
-Isaac Sim's embedded Python lacks `torch`. Inject the `env_isaaclab` conda packages via `PYTHONPATH`:
 
-```bat
-set PYTHONPATH=C:\Users\<user>\miniconda3\envs\env_isaaclab\Lib\site-packages
-```
-
-Install the OpenAI client (needed for LM Studio) into env_isaaclab:
-
-```bat
-C:\Users\<user>\miniconda3\envs\env_isaaclab\python.exe -m pip install openai
-```
-
----
-
-## Running
-
-All commands are run in Windows CMD.
-
-### Grid placement (default) — transfer all 4 objects to individual slots in Bin B
-
-```bat
-set PYTHONPATH=C:\Users\<user>\miniconda3\envs\env_isaaclab\Lib\site-packages
-C:\isaacsim\python.bat \\wsl$\Ubuntu\home\<user>\isaac_pick_place\run.py
-```
-
-### With a natural language command (Anthropic)
-
-```bat
-C:\isaacsim\python.bat \\wsl$\Ubuntu\home\<user>\isaac_pick_place\run.py ^
-  --command "pick the blue pillar first, skip the yellow block" ^
-  --api-key sk-ant-YOUR_KEY_HERE
-```
-
-### With a natural language command (LM Studio / Qwen3)
-
-Start the LM Studio local server first (load Qwen3, click Start Server), then:
-
-```bat
-C:\isaacsim\python.bat \\wsl$\Ubuntu\home\<user>\isaac_pick_place\run.py ^
-  --command "pick the blue pillar first, skip the yellow block"
-```
-
-### Stacking mode — LLM decides order, stacks all blocks
-
-```bat
-C:\isaacsim\python.bat \\wsl$\Ubuntu\home\<user>\isaac_pick_place\run.py ^
-  --stack --api-key sk-ant-YOUR_KEY_HERE
-```
-
-### Skip vision (fastest, uses ground-truth positions)
-
-```bat
-C:\isaacsim\python.bat \\wsl$\Ubuntu\home\<user>\isaac_pick_place\run.py --no-vision
-```
-
-### Headless
-
-```bat
-C:\isaacsim\python.bat \\wsl$\Ubuntu\home\<user>\isaac_pick_place\run.py --headless --no-vision
-```
-
-### Multiple episodes
-
-```bat
-C:\isaacsim\python.bat \\wsl$\Ubuntu\home\<user>\isaac_pick_place\run.py --episodes 3
-```
-
----
 
 ## Project structure
 
