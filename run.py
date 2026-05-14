@@ -23,6 +23,10 @@ parser.add_argument("--command",    type=str, default=None,
                     help='Natural language pick instruction, e.g. "pick the blue pillar first"')
 parser.add_argument("--api-key",    type=str, default=None,
                     help="Anthropic API key (overrides ANTHROPIC_API_KEY env var)")
+parser.add_argument("--stack",         action="store_true",
+                    help="Stack all objects on top of each other in Bin B")
+parser.add_argument("--stack-retries", type=int, default=4,
+                    help="Max attempts per object when stacking (default 4)")
 args, _ = parser.parse_known_args()
 
 from isaacsim import SimulationApp
@@ -277,6 +281,78 @@ def run_pick_place(world, franka, controller, art_ctrl,
     return False   # timeout
 
 
+def retreat_arm(world, franka, controller, art_ctrl, max_steps=200):
+    """
+    Lift the gripper straight up to HOVER_Z before moving anywhere else.
+    Prevents the arm from sweeping through a placed stack on its way back to Bin A.
+    """
+    hand_pos, _ = franka.end_effector.get_world_pose()
+    # panda_hand is HAND_OFFSET_Z above right_gripper; target right_gripper at HOVER_Z
+    rg_xy       = hand_pos[:2].copy()
+    retreat_tgt = np.array([rg_xy[0], rg_xy[1], HOVER_Z])
+    print(f"    [RETREAT] lifting to HOVER_Z={HOVER_Z:.2f} …")
+    for _ in range(max_steps):
+        world.step(render=True)
+        if not world.is_playing():
+            continue
+        art_ctrl.apply_action(controller.forward(
+            target_end_effector_position=retreat_tgt,
+            target_end_effector_orientation=ORIENT_DOWN,
+        ))
+        art_ctrl.apply_action(franka.gripper.forward("open"))
+        cur, _ = franka.end_effector.get_world_pose()
+        if np.linalg.norm(cur - (retreat_tgt + np.array([0, 0, HAND_OFFSET_Z]))) < POS_TOL_MOVE:
+            break
+
+
+def check_and_repair_stack(world, franka, controller, art_ctrl,
+                            objs, stacked_indices, bin_ctr):
+    """
+    Verify every previously placed block is still on the stack.
+    Re-picks and re-stacks any that have fallen.
+    Returns the measured actual stack top Z.
+    """
+    stack_z = TABLE_H
+    for obj_i in stacked_indices:
+        obj              = objs[obj_i]
+        name, _, size, _ = OBJ_DEFS[obj_i]
+        pos              = obj.get_local_pose()[0]
+        dist_xy          = float(np.linalg.norm(pos[:2] - bin_ctr))
+        expected_top     = stack_z + size[2]
+        actual_top       = float(pos[2]) + size[2] / 2
+
+        still_on = dist_xy < 0.08 and abs(actual_top - expected_top) < 0.04
+
+        if still_on:
+            stack_z += size[2]
+            print(f"    [REPAIR] {name} on stack ✓  stack_top={stack_z:.3f}")
+        else:
+            print(f"    [REPAIR] {name} fell!  pos={np.round(pos,3)} — re-stacking …")
+            place_z  = stack_z + size[2] / 2
+            bx, by   = float(bin_ctr[0]), float(bin_ctr[1])
+            px, py   = float(pos[0]),     float(pos[1])
+
+            ok = run_pick_place(
+                world, franka, controller, art_ctrl,
+                hover_pick  = np.array([px,  py,  HOVER_Z]),
+                grasp_tgt   = np.array([px,  py,  float(pos[2])]),
+                hover_place = np.array([bx,  by,  HOVER_Z]),
+                place_tgt   = np.array([bx,  by,  place_z]),
+                tag=f"repair-{name}",
+            )
+            for _ in range(60):
+                world.step(render=True)
+
+            if ok:
+                stack_z += size[2]
+                print(f"    [REPAIR] {name} re-stacked ✓  stack_top={stack_z:.3f}")
+                retreat_arm(world, franka, controller, art_ctrl)
+            else:
+                print(f"    [REPAIR] {name} repair failed — continuing with current stack")
+
+    return stack_z
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -297,6 +373,9 @@ def main():
     # ---- Language command ---------------------------------------------------
     if args.command:
         instruction = args.command
+    elif args.stack:
+        # In stack mode the LLM decides the best order — no user prompt needed
+        instruction = "Stack all objects. Order them for maximum stability, widest and flattest base first."
     else:
         print("\nObjects available:")
         print("  0 — red square cube     (4×4×4 cm)")
@@ -330,73 +409,131 @@ def main():
         controller = RMPFlowController(name="rmpflow_ctrl", robot_articulation=franka)
         art_ctrl   = franka.get_articulation_controller()
 
-        ep_ok = []
+        ep_ok         = []
+        stack_z       = TABLE_H   # actual measured stack top
+        stacked_so_far = []       # obj indices successfully stacked this episode
 
         for i in pick_order:
             obj                   = objs[i]
             name, label, size, _  = OBJ_DEFS[i]
-            grasp_z  = TABLE_H + size[2] / 2
-            pick_xy  = BIN_A_CTR + GRID_OFFSETS[i]
-            place_xy = BIN_B_CTR + GRID_OFFSETS[i]
+            nominal_grasp_z = TABLE_H + size[2] / 2
+            pick_xy         = BIN_A_CTR + GRID_OFFSETS[i]
 
-            print(f"\n  ── Object {i+1}/4  [{name}]  "
-                  f"size={np.round(size*100,1)} cm  grasp_z={grasp_z:.3f} m")
-
-            # ---- Vision / ground-truth detection ----------------------------
-            if args.no_vision:
-                detected = obj.get_local_pose()[0]
-                print(f"    [VISION] skipped — gt {np.round(detected, 3)}")
+            if args.stack:
+                place_xy    = BIN_B_CTR.copy()
+                place_z     = stack_z + size[2] / 2
             else:
-                print(f"    [VISION] detecting '{label}' …")
-                detected = detector.detect(table_z=grasp_z, label=label)
-                if detected is not None:
-                    gt  = obj.get_local_pose()[0]
-                    err = np.round(detected[:2] - gt[:2], 3)
-                    print(f"    [VISION] detected={np.round(detected,3)}  "
-                          f"gt={np.round(gt,3)}  xy_err={err}")
+                place_xy    = BIN_B_CTR + GRID_OFFSETS[i]
+                place_z     = nominal_grasp_z
+
+            # Before picking, verify all previously stacked blocks are still there
+            if args.stack and stacked_so_far:
+                print(f"\n  [REPAIR] Checking stack before picking [{name}] …")
+                stack_z = check_and_repair_stack(
+                    world, franka, controller, art_ctrl,
+                    objs, stacked_so_far, BIN_B_CTR,
+                )
+                place_z = stack_z + size[2] / 2   # recompute with measured height
+
+            print(f"\n  ── [{name}]  size={np.round(size*100,1)} cm", end="")
+            if args.stack:
+                print(f"  stack_z={stack_z:.3f}  place_z={place_z:.3f}")
+            else:
+                print()
+
+            max_attempts = args.stack_retries if args.stack else 1
+            placed = False
+
+            for attempt in range(1, max_attempts + 1):
+                if attempt > 1:
+                    print(f"\n    [RETRY] attempt {attempt}/{max_attempts} for [{name}]")
+
+                # ---- Detect pick position -----------------------------------
+                if attempt == 1:
+                    if args.no_vision:
+                        detected   = obj.get_local_pose()[0]
+                        pick_grasp_z = nominal_grasp_z
+                        print(f"    [VISION] skipped — gt {np.round(detected,3)}")
+                    else:
+                        print(f"    [VISION] detecting '{label}' …")
+                        detected = detector.detect(table_z=nominal_grasp_z, label=label)
+                        if detected is not None:
+                            gt  = obj.get_local_pose()[0]
+                            err = np.round(detected[:2] - gt[:2], 3)
+                            print(f"    [VISION] det={np.round(detected,3)}  gt={np.round(gt,3)}  err={err}")
+                        else:
+                            detected = obj.get_local_pose()[0]
+                            print(f"    [VISION] failed → fallback gt {np.round(detected,3)}")
+                        pick_grasp_z = nominal_grasp_z
                 else:
-                    detected = obj.get_local_pose()[0]
-                    print(f"    [VISION] failed → fallback gt {np.round(detected,3)}")
+                    # Block fell — use ground truth to find where it landed
+                    gt_pos       = obj.get_local_pose()[0]
+                    detected     = gt_pos
+                    pick_grasp_z = float(gt_pos[2])   # actual centre Z after falling
+                    print(f"    [RETRY]  gt pos={np.round(gt_pos,3)}  re-pick grasp_z={pick_grasp_z:.3f}")
 
-            # ---- Compute waypoints ------------------------------------------
-            px, py = float(detected[0]),  float(detected[1])
-            bx, by = float(place_xy[0]),  float(place_xy[1])
+                # ---- Waypoints ---------------------------------------------
+                px, py = float(detected[0]), float(detected[1])
+                bx, by = float(place_xy[0]), float(place_xy[1])
 
-            hover_pick  = np.array([px, py, HOVER_Z])
-            grasp_tgt   = np.array([px, py, grasp_z])
-            hover_place = np.array([bx, by, HOVER_Z])
-            place_tgt   = np.array([bx, by, grasp_z])
+                hover_pick  = np.array([px, py, HOVER_Z])
+                grasp_tgt   = np.array([px, py, pick_grasp_z])
+                hover_place = np.array([bx, by, HOVER_Z])
+                place_tgt   = np.array([bx, by, place_z])
 
-            print(f"    pick  hover={np.round(hover_pick,3)}  "
-                  f"grasp={np.round(grasp_tgt,3)}")
-            print(f"    place hover={np.round(hover_place,3)}  "
-                  f"target={np.round(place_tgt,3)}")
+                print(f"    pick  hover={np.round(hover_pick,3)}  grasp={np.round(grasp_tgt,3)}")
+                print(f"    place hover={np.round(hover_place,3)}  target={np.round(place_tgt,3)}")
 
-            # ---- Execute ----------------------------------------------------
-            ok = run_pick_place(world, franka, controller, art_ctrl,
-                                hover_pick, grasp_tgt, hover_place, place_tgt,
-                                name)
+                # ---- Execute -----------------------------------------------
+                ok = run_pick_place(world, franka, controller, art_ctrl,
+                                    hover_pick, grasp_tgt, hover_place, place_tgt,
+                                    name)
 
-            if ok:
+                if not ok:
+                    print(f"    [RESULT] TIMEOUT — {'retrying' if attempt < max_attempts else 'giving up'}")
+                    continue
+
+                # Let physics settle before checking
+                for _ in range(60):
+                    world.step(render=True)
+
                 final = obj.get_local_pose()[0]
-                dist  = float(np.linalg.norm(final[:2] - place_xy))
-                ok    = dist < 0.12
-                print(f"    [RESULT] final={np.round(final,3)}  "
-                      f"dist_to_slot={dist:.3f} m  {'OK' if ok else 'FAIL'}")
-            else:
-                print(f"    [RESULT] TIMEOUT")
 
-            ep_ok.append(ok)
+                if args.stack:
+                    dist_xy  = float(np.linalg.norm(final[:2] - place_xy))
+                    actual_z = float(final[2])
+                    stack_ok = dist_xy < 0.06 and actual_z > (place_z - 0.025)
+                    print(f"    [STACK] final={np.round(final,3)}  "
+                          f"dist_xy={dist_xy:.3f}  z={actual_z:.3f}  "
+                          f"exp_z={place_z:.3f}  {'STACKED ✓' if stack_ok else 'FELL ✗'}")
+                    # Always retreat before the next move to avoid hitting the stack
+                    retreat_arm(world, franka, controller, art_ctrl)
+                    if stack_ok:
+                        stack_z  += size[2]
+                        stacked_so_far.append(i)
+                        placed    = True
+                        break
+                    else:
+                        print(f"    [STACK] {'retrying …' if attempt < max_attempts else 'giving up after max retries'}")
+                else:
+                    dist   = float(np.linalg.norm(final[:2] - place_xy))
+                    placed = dist < 0.12
+                    print(f"    [RESULT] final={np.round(final,3)}  "
+                          f"dist_to_slot={dist:.3f} m  {'OK' if placed else 'FAIL'}")
+                    break
+
+            ep_ok.append(placed)
 
         all_results.append(ep_ok)
 
     simulation_app.close()
 
-    print(f"\n{'='*60}")
+    mode_str = "STACK" if args.stack else "GRID"
+    print(f"\n{'='*60}  [{mode_str} MODE]")
     for ep, res in enumerate(all_results):
         n = sum(res)
-        print(f"Episode {ep+1}: {n}/{len(res)} objects transferred")
-        for idx, (obj_i, ok) in enumerate(zip(pick_order, res)):
+        print(f"Episode {ep+1}: {n}/{len(res)} objects {'stacked' if args.stack else 'placed'}")
+        for obj_i, ok in zip(pick_order, res):
             print(f"  {OBJ_DEFS[obj_i][0]:6s} ({np.round(OBJ_DEFS[obj_i][2]*100,0)} cm): "
                   f"{'OK' if ok else 'FAIL'}")
     print(f"{'='*60}")

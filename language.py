@@ -1,23 +1,29 @@
 """
 language.py — Natural language command parser for FrankaVisionPick.
 
-Sends the user's instruction to Claude and gets back a pick order.
+Supports two backends (auto-detected):
+  1. LM Studio local server (free, no key needed)  ← preferred
+  2. Anthropic Claude Haiku (cloud, needs --api-key) ← fallback
+
+LM Studio setup:
+  - Open LM Studio → Local Server tab → Start Server (port 1234)
+  - Load any model (gemma-4, qwen, etc.)
 
 Usage:
     from language import parse_command
     order = parse_command("pick the blue pillar first, skip the yellow block")
-    # → [1, 2, 0]   (indices into OBJ_DEFS)
+    # → [1, 0, 2]
 """
 
 import os
 import json
+import re
 
-# Object descriptions shown to the LLM
 OBJ_DESCRIPTIONS = [
-    "0 = red square cube     (4×4×4 cm)",
-    "1 = blue tall pillar    (3×3×7 cm)",
-    "2 = green flat tile     (5×5×3.5 cm)",
-    "3 = yellow medium block (4×4×5.5 cm)",
+    "0 = red square cube     (4x4x4 cm,  base area 16 cm²)",
+    "1 = blue tall pillar    (3x3x7 cm,  base area  9 cm²,  tallest)",
+    "2 = green flat tile     (5x5x3.5 cm, base area 25 cm², widest — best stack base)",
+    "3 = yellow medium block (4x4x5.5 cm, base area 16 cm²)",
 ]
 
 _SYSTEM = f"""You control a Franka Panda robot arm that picks objects from Bin A and places them in Bin B.
@@ -39,39 +45,115 @@ Rules:
 - If the instruction is ambiguous, use default order [0,1,2,3].
 
 Examples:
-  "pick the red one first"         → {{"order":[0,1,2,3], "reason":"red first, rest default"}}
-  "blue pillar then green tile"    → {{"order":[1,2,0,3], "reason":"blue then green as requested"}}
-  "skip the yellow block"          → {{"order":[0,1,2],   "reason":"all except yellow"}}
-  "tallest first"                  → {{"order":[1,3,0,2], "reason":"sorted by height: 7cm,5.5cm,4cm,3.5cm"}}
-  "only pick the green and red"    → {{"order":[2,0],     "reason":"only green and red as requested"}}
+  "pick the red one first"         -> {{"order":[0,1,2,3], "reason":"red first, rest default"}}
+  "blue pillar then green tile"    -> {{"order":[1,2,0,3], "reason":"blue then green as requested"}}
+  "skip the yellow block"          -> {{"order":[0,1,2],   "reason":"all except yellow"}}
+  "tallest first"                  -> {{"order":[1,3,0,2], "reason":"sorted by height: 7cm,5.5cm,4cm,3.5cm"}}
+  "only pick the green and red"    -> {{"order":[2,0],     "reason":"only green and red as requested"}}
 """
 
+# LM Studio server address — change port if you moved it
+LM_STUDIO_URL = "http://localhost:1234/v1"
 
-def parse_command(text: str, api_key: str = None, default: list = None) -> list:
-    """
-    Parse a natural language pick instruction and return a list of object indices.
 
-    api_key can be passed directly or read from ANTHROPIC_API_KEY env var.
-    Falls back to `default` (= [0,1,2,3]) if the key is missing or the call fails.
-    """
-    if default is None:
-        default = [0, 1, 2, 3]
+def _strip_fences(text: str) -> str:
+    if text.startswith("```"):
+        text = "\n".join(
+            line for line in text.splitlines()
+            if not line.strip().startswith("```")
+        ).strip()
+    return text
 
-    key = (api_key or os.environ.get("ANTHROPIC_API_KEY", "")).strip()
-    if not key:
-        print("[LANG] ✗ No API key found.")
-        print("[LANG]   Pass it with:  --api-key sk-ant-...")
-        print("[LANG]   Or set env var: set ANTHROPIC_API_KEY=sk-ant-...")
-        print("[LANG]   Falling back to default order [0,1,2,3].")
-        return default
 
-    print(f"[LANG] API key found (****{key[-4:]})")
+def _validate(order) -> bool:
+    return (
+        isinstance(order, list)
+        and all(isinstance(x, int) and 0 <= x <= 3 for x in order)
+        and len(set(order)) == len(order)
+    )
+
+
+def _call_lmstudio(text: str) -> list | None:
+    """Call LM Studio local server (OpenAI-compatible API)."""
+    try:
+        from openai import OpenAI
+    except ImportError:
+        print("[LANG] openai package not found — run: pip install openai")
+        return None
 
     try:
-        import anthropic
-        print("[LANG] Calling Claude Haiku …")
-        client = anthropic.Anthropic(api_key=key)
+        client = OpenAI(base_url=LM_STUDIO_URL, api_key="lm-studio")
 
+        # Auto-detect whichever model is loaded in LM Studio
+        models = client.models.list()
+        model_id = models.data[0].id if models.data else "local-model"
+        print(f"[LANG] Calling LM Studio ({model_id}) …")
+
+        resp = client.chat.completions.create(
+            model=model_id,
+            messages=[
+                {"role": "system", "content": _SYSTEM},
+                {"role": "user",   "content": text},
+            ],
+            max_tokens=512,   # thinking mode needs more tokens
+            temperature=0.1,
+        )
+
+        msg_dict = resp.choices[0].message.model_dump()
+        raw      = msg_dict.get("content") or ""
+
+        # Qwen3 thinking mode puts the chain-of-thought in reasoning_content
+        # and sometimes leaves content empty. Extract the last list from reasoning.
+        if not raw.strip():
+            reasoning = msg_dict.get("reasoning_content") or ""
+            print(f"[LANG] content empty — searching reasoning ({len(reasoning)} chars)")
+            matches = re.findall(r'\[\s*[\d,\s]+\]', reasoning)
+            if matches:
+                candidate = matches[-1]
+                print(f"[LANG] Extracted from reasoning: {candidate}")
+                try:
+                    order = json.loads(candidate)
+                    if _validate(order):
+                        print(f"[LANG] ✓ Order from reasoning: {order}")
+                        return order
+                except Exception:
+                    pass
+            print("[LANG] ✗ LM Studio returned empty response and no order in reasoning.")
+            return None
+
+        raw = raw.strip()
+        print(f"[LANG] Raw response: {raw}")
+        raw = _strip_fences(raw)
+        result = json.loads(raw)
+        order = result["order"]
+
+        if _validate(order):
+            print(f"[LANG] ✓ Reason: {result.get('reason', '')}")
+            return order
+
+        print("[LANG] ✗ Unexpected format from LM Studio.")
+        return None
+
+    except ConnectionRefusedError:
+        print("[LANG] ✗ LM Studio server not running.")
+        print("[LANG]   Open LM Studio → Local Server → Start Server")
+        return None
+    except Exception as e:
+        print(f"[LANG] ✗ LM Studio error: {e}")
+        return None
+
+
+def _call_anthropic(text: str, api_key: str) -> list | None:
+    """Call Anthropic Claude Haiku (cloud fallback)."""
+    try:
+        import anthropic
+    except ImportError:
+        print("[LANG] anthropic package not found.")
+        return None
+
+    try:
+        print("[LANG] Calling Claude Haiku (cloud) …")
+        client = anthropic.Anthropic(api_key=api_key)
         msg = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=128,
@@ -79,22 +161,48 @@ def parse_command(text: str, api_key: str = None, default: list = None) -> list:
             messages=[{"role": "user", "content": text}],
         )
 
-        raw    = msg.content[0].text.strip()
+        raw = msg.content[0].text.strip()
         print(f"[LANG] Raw response: {raw}")
+        raw = _strip_fences(raw)
         result = json.loads(raw)
-        order  = result["order"]
+        order = result["order"]
 
-        # Validate — must be a list of unique ints in 0-3
-        if (isinstance(order, list)
-                and all(isinstance(x, int) and 0 <= x <= 3 for x in order)
-                and len(set(order)) == len(order)):
+        if _validate(order):
             print(f"[LANG] ✓ Reason: {result.get('reason', '')}")
             return order
 
-        print(f"[LANG] ✗ Unexpected format — using default order.")
-        return default
+        print("[LANG] ✗ Unexpected format from Anthropic.")
+        return None
 
     except Exception as e:
-        print(f"[LANG] ✗ Error: {e}")
-        print("[LANG]   Falling back to default order [0,1,2,3].")
-        return default
+        print(f"[LANG] ✗ Anthropic error: {e}")
+        return None
+
+
+def parse_command(text: str, api_key: str = None, default: list = None) -> list:
+    """
+    Parse a natural language pick instruction → list of object indices.
+
+    Priority:
+      1. LM Studio local server (no key needed, free)
+      2. Anthropic Claude Haiku (if --api-key passed or ANTHROPIC_API_KEY set)
+      3. Default order [0,1,2,3]
+    """
+    if default is None:
+        default = [0, 1, 2, 3]
+
+    # 1. Try LM Studio first
+    order = _call_lmstudio(text)
+    if order is not None:
+        return order
+
+    # 2. Fall back to Anthropic if a key is available
+    key = (api_key or os.environ.get("ANTHROPIC_API_KEY", "")).strip()
+    if key:
+        print(f"[LANG] Falling back to Anthropic (****{key[-4:]}) …")
+        order = _call_anthropic(text, key)
+        if order is not None:
+            return order
+
+    print("[LANG] All backends failed — using default order [0,1,2,3].")
+    return default
